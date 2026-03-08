@@ -1,0 +1,4 @@
+interface:
+  display_name: "Research Papers"
+  short_description: "Research and synthesize scientific literature"
+  default_prompt: "Use $research-papers to find, evaluate, and summarize the strongest papers on a topic."
