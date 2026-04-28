@@ -30,6 +30,8 @@ Low:
 - Vague methods
 - Strong claims with weak support
 
+When full text is available, always read it before finalizing the ranking. Abstract-only assessments should be treated as provisional until confirmed by full-text reading.
+
 ### Methodological value
 
 High:
@@ -77,6 +79,8 @@ Lower confidence:
 - Do not let citation count dominate direct relevance.
 - Separate preprints from published work in the final presentation.
 - Prefer papers with accessible full text when the task requires detailed synthesis.
+- Note which papers have resolved full-text URLs. Prioritize reading those during evidence extraction.
+- When two papers are otherwise equal in relevance, prefer the one with full-text access.
 
 ## Note Template
 

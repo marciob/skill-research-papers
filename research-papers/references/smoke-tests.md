@@ -22,11 +22,15 @@ Use it to avoid overstating which sources currently behave like clean public API
 - Result: returned Atom XML with `<feed>` and `<entry>`
 - Interpretation: query API working from this environment
 
+Full-text note: arXiv HTML at `https://arxiv.org/html/{id}` is available for most recent papers. Older papers may only have PDF at `https://arxiv.org/pdf/{id}`. Both endpoints are free and unauthenticated.
+
 ### OpenAlex
 
 - Endpoint tested: `https://api.openalex.org/works?search=graph%20neural%20network&per-page=1`
 - Result: returned JSON with `meta` and `results`
 - Interpretation: works search working from this environment
+
+Full-text note: OpenAlex `open_access` and `best_oa_location` fields are included in the standard response when requested via `select=`. These point to external OA copies (arXiv, PMC, repositories) and are highly reliable for resolving full-text access.
 
 ### ACM Digital Library
 
@@ -50,11 +54,15 @@ Use it to avoid overstating which sources currently behave like clean public API
 - Result: one unrestricted smoke-test run returned JSON data, while the later rerun returned a JSON error with code `429`
 - Interpretation: endpoint exists and can work from this environment, but anonymous access is unstable and should be treated as rate-limit-sensitive
 
+Full-text note: The `openAccessPdf` field (requested via `fields=openAccessPdf`) returns a URL to a freely accessible PDF when available. Reliability depends on the paper — many CS papers have OA PDFs, but coverage varies by field.
+
 ### PubMed
 
 - Endpoint tested: `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=graph%20neural%20network&retmax=1&retmode=json`
 - Result: returned JSON with `esearchresult` and a PubMed ID
 - Interpretation: ESearch working from this environment
+
+Full-text note: PMC efetch (`db=pmc&rettype=full&retmode=xml`) provides full-text XML for articles with a PMCID. The PMID-to-PMCID mapping is available via the ID Converter API at `https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/`. PMC HTML is also available at `https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/`.
 
 ### SSRN
 
@@ -68,3 +76,10 @@ Use it to avoid overstating which sources currently behave like clean public API
 - DBLP is still useful, but validate the specific endpoint you depend on.
 - Semantic Scholar works, but API-key-first is still the right default for reliability.
 - ACM Digital Library and SSRN should be treated as web sources unless you have a browser-driven workflow or a private integration.
+
+### Full-text source reliability
+
+- **High reliability**: arXiv (HTML and PDF, free), PMC (XML and HTML via efetch, free for PMCID articles), OpenAlex OA metadata (points to external copies)
+- **Medium reliability**: Semantic Scholar `openAccessPdf` (good coverage for CS, variable elsewhere)
+- **Low reliability**: SSRN (bot protection, inconsistent), ACM DL (blocked by Cloudflare)
+- **Not applicable**: DBLP (bibliographic only — use identifiers to resolve full text elsewhere)

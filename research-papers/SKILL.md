@@ -18,6 +18,8 @@ model: opus
 
 Use this skill to turn broad paper-search requests into a defensible literature search and synthesis. Start broad, narrow with explicit criteria, prefer stable landing pages and full text when available, and separate discovery metadata from evidence claims.
 
+**Full-text reading is the default, not the exception.** For every shortlisted paper, you MUST attempt to fetch and read the entire paper content — not just the abstract. Download PDFs when HTML full text is unavailable. Only fall back to abstract-based analysis when all full-text access methods have been exhausted and failed.
+
 Common requests this skill should handle:
 
 - Find the top papers on a topic
@@ -29,10 +31,11 @@ Common requests this skill should handle:
 
 When executing API calls and web lookups, use whatever tools your platform provides:
 
-- **Shell / Bash / terminal**: Use `curl` to call research APIs directly (arXiv, OpenAlex, DBLP, Semantic Scholar, PubMed)
-- **Web fetch**: Use your platform's web fetch tool to access paper landing pages, abstracts, and content
-- **Web search**: Use your platform's web search tool for broad discovery when APIs are insufficient
-- **File read**: Read the reference files in this skill directory for detailed guidance
+- **Full-text fetch + parse (canonical path)**: Use the `scripts/fetch_and_parse` helper. It resolves any identifier (DOI, arXiv ID, PMID, PMCID, URL), runs the OA cascade, downloads the PDF/HTML/XML, and writes a layout-aware Markdown rendering you can read with the harness Read tool. Output is cached at `~/.cache/research-papers/`, so repeat invocations on the same paper are free.
+- **Shell / Bash / terminal**: Use `curl` for *discovery* against research APIs (arXiv, OpenAlex, DBLP, Semantic Scholar, PubMed). Once you have an identifier, switch to `fetch_and_parse` for the full text — do not hand-roll PDF downloads or pass raw PDFs through the Read tool.
+- **Web fetch**: Use your platform's web fetch tool only for source pages the script does not handle (publisher search results, ACM landing pages).
+- **Web search**: Use your platform's web search tool for broad discovery when APIs are insufficient.
+- **File read**: Read the reference files in this skill directory for detailed guidance.
 
 ## Workflow
 
@@ -101,6 +104,17 @@ For each paper, capture:
 - Abstract or summary
 - Source used to find it
 - Citation or influence indicators if available
+- Full-text URL (if resolved)
+- Full-text format: HTML, PDF, or XML
+- Full-text source: arXiv HTML, PMC, OpenAlex OA, Semantic Scholar OA, SSRN, or DOI landing
+
+#### Resolve full-text access
+
+For each paper, attempt to resolve a full-text URL using the cascade in [api-playbook.md](./references/api-playbook.md#full-text-resolution):
+
+1. arXiv HTML → arXiv PDF → PMC XML → PMC HTML → OpenAlex OA → Semantic Scholar OA → SSRN page → DOI landing
+2. Record which step succeeded and what format the full text is in.
+3. If no full-text source is found, mark the paper as abstract-only.
 
 Use multiple sources in parallel when possible. For example, run OpenAlex and arXiv API queries concurrently.
 
@@ -130,26 +144,58 @@ Separate these categories explicitly:
 
 Never imply that arXiv or SSRN papers are peer reviewed unless publication status is verified.
 
-### 6. Read and extract evidence
+### 6. Read and extract evidence (CRITICAL — read the full paper)
 
-Prefer full text over abstract-only summaries when making substantive claims.
+**This is the most important step.** For each shortlisted paper, fetch and read the complete paper content via the `scripts/fetch_and_parse` helper. Do not hand-roll PDF downloads, do not pass raw PDFs to the Read tool, and do not settle for abstracts when full text is accessible.
 
-Use your web fetch tool to access paper landing pages and abstracts for deeper information when available.
+#### Canonical command
 
-For the final shortlist, extract:
+```bash
+SKILL_DIR="$HOME/.claude/skills/research-papers"
+"$SKILL_DIR/scripts/fetch_and_parse" "<identifier>"
+```
 
-- Problem addressed
-- Core method or argument
-- Data, benchmarks, or corpus used
-- Main findings
-- Limitations
-- Why the paper matters for the user's question
+`<identifier>` can be a DOI, arXiv ID, PMID, PMCID, or URL — in any common form (`10.1038/...`, `arxiv:2301.08243`, `https://arxiv.org/abs/2301.08243`, `PMC4304851`, etc.). The script:
 
-Mark whether a claim comes from:
+1. Resolves the identifier into canonical IDs.
+2. Runs the OA cascade: arXiv (HTML→PDF) → PMC (XML→HTML) → Unpaywall → OpenAlex `best_oa_location` → Semantic Scholar `openAccessPdf` → Crossref TDM links → DOI landing.
+3. Caches the raw file and a layout-aware Markdown parse to `~/.cache/research-papers/<canonical_id>/`.
+4. Prints a JSON record with `status` (`ok`, `abstract_only`, `failed`), `parsed_path`, `source`, and a `tried` log of what each step returned.
 
-- Full text
-- Abstract only
-- Secondary metadata
+When `status` is `ok`, read the file at `parsed_path` with the harness Read tool. The parsed Markdown preserves section headings, abstract, body, and figure captions. **Read the entire file** — for very long papers (>50KB parsed), read in segments: title + abstract + introduction first, then methods + results, then discussion + limitations.
+
+**Always set `OPENALEX_EMAIL` (and ideally `UNPAYWALL_EMAIL`)** in the environment before invoking the script. Without it Unpaywall is skipped and OpenAlex falls into the slower common pool; with it, full-text recovery rates roughly double for paywalled DOIs. Other useful env vars: `SEMANTIC_SCHOLAR_API_KEY`, `NCBI_API_KEY`, `NCBI_EMAIL`.
+
+#### Cascade fallback
+
+The script handles cross-source resolution internally — there is no need to manually try OpenAlex after arXiv fails, or to look up PMID→PMCID, or to retry on 429s. If the script returns `failed`, it has exhausted the cascade. Inspect the `tried` array in the JSON to see what each step returned.
+
+If you still want to try a specific URL the cascade missed (e.g., an author homepage), pass the URL directly:
+
+```bash
+"$SKILL_DIR/scripts/fetch_and_parse" "https://example.edu/~author/paper.pdf"
+```
+
+#### Extraction from full text
+
+From the parsed Markdown, extract:
+
+- **Introduction**: Problem framing and motivation
+- **Methods**: Core method or argument, experimental design
+- **Results**: Main findings, benchmarks, quantitative outcomes
+- **Discussion**: Interpretation, comparison with prior work
+- **Limitations**: Stated limitations and caveats
+- **Key figures/tables**: Summarize main quantitative results from tables and figure descriptions
+
+**Read thoroughly.** Do not skim. The user is asking you to research papers because they want deep understanding, not surface-level summaries.
+
+#### When full text is truly unavailable
+
+If the script returns `status: "abstract_only"` or `failed`, surface that clearly in the output and explain which steps were tried (from the `tried` field). Tag every claim with its evidence depth:
+
+- Full text `[Full text]`
+- Abstract only `[Abstract only — full text unavailable: {reason from tried log}]`
+- Metadata only `[Metadata only]`
 
 ### 7. Synthesize for the user
 
@@ -168,6 +214,8 @@ The answer should:
 If the evidence base is thin, conflicting, or very recent, say so directly.
 
 If a paper was found through an index but the full text was not accessed, label the synthesis as metadata-based.
+
+Note which papers lacked full-text access and how that limits the synthesis. For example: "3 of 8 shortlisted papers were assessed from abstracts only because full text was paywalled or unavailable, which limits confidence in the methods comparison."
 
 Do not invent:
 
