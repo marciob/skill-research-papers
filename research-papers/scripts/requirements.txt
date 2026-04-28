@@ -1,0 +1,4 @@
+# Optional but strongly recommended for layout-aware Markdown extraction from PDFs.
+# fetch_and_parse.py falls back to pymupdf alone, then to the `pdftotext` binary,
+# but quality is best with pymupdf4llm.
+pymupdf4llm>=0.0.17

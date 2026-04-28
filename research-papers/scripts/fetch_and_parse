@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Wrapper for fetch_and_parse.py that prefers a local venv, bootstraps one on
+# first use if missing, and falls back to system python if bootstrap fails.
+#
+# The local venv at scripts/.venv carries pymupdf4llm for layout-aware
+# Markdown extraction. Without it the Python script still works using
+# pdftotext as a basic fallback.
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="${SCRIPT_DIR}/.venv"
+VENV_PY="${VENV_DIR}/bin/python"
+PY_SCRIPT="${SCRIPT_DIR}/fetch_and_parse.py"
+REQ_FILE="${SCRIPT_DIR}/requirements.txt"
+
+bootstrap_venv() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 -m venv "$VENV_DIR" >&2 || return 1
+  "$VENV_PY" -m pip install --quiet --upgrade pip >&2 || true
+  "$VENV_PY" -m pip install --quiet -r "$REQ_FILE" >&2 || return 1
+  return 0
+}
+
+if [[ ! -x "$VENV_PY" ]]; then
+  bootstrap_venv >&2 || true
+fi
+
+if [[ -x "$VENV_PY" ]]; then
+  exec "$VENV_PY" "$PY_SCRIPT" "$@"
+fi
+
+exec python3 "$PY_SCRIPT" "$@"

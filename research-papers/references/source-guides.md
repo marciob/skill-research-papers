@@ -12,6 +12,18 @@ Use this file when deciding where to search, how to interpret each source, and w
 - Use arXiv for recent preprints and fast-moving fields.
 - Use SSRN for economics, law, finance, and social-science working papers.
 
+## Full-Text Access by Source
+
+| Source | Full Text | Method | Reliability |
+|--------|-----------|--------|-------------|
+| arXiv | Yes (free) | HTML at `/html/{id}` or PDF at `/pdf/{id}` | High |
+| PMC | Yes (if PMCID) | XML via efetch or HTML page | High |
+| OpenAlex | OA URL metadata | Points to external OA via `best_oa_location` | High |
+| Semantic Scholar | OA PDF URL | Points to external OA via `openAccessPdf` | Medium |
+| SSRN | Sometimes | PDF from abstract page | Low |
+| ACM DL | Rarely | Blocked by bot protection | Low |
+| DBLP | No | Bibliographic only — use DOI/arXiv ID to resolve elsewhere | N/A |
+
 ## Source Notes
 
 ### arXiv
@@ -27,6 +39,7 @@ Record:
 - Version if visible
 - Category
 - Link to any later journal or conference version
+- Full-text URL (if resolved): HTML at `/html/{id}` or PDF at `/pdf/{id}`
 
 Watch for:
 
@@ -47,6 +60,7 @@ Record:
 - DOI when present
 - OpenAlex work URL if needed for metadata tracing
 - Venue and year
+- Full-text URL (if resolved): from `best_oa_location.url`
 
 Watch for:
 
@@ -66,6 +80,7 @@ Record:
 - DOI
 - ACM DL URL
 - Venue and year
+- Full-text URL (if resolved): via OpenAlex OA lookup on DOI
 
 Watch for:
 
@@ -84,6 +99,7 @@ Record:
 
 - DBLP URL only if needed for bibliographic support
 - Canonical DOI or publisher page separately
+- Full-text URL (if resolved): use DOI or arXiv ID from record to resolve elsewhere
 
 Watch for:
 
@@ -102,6 +118,7 @@ Record:
 
 - DOI if present
 - Semantic Scholar URL only if needed for discovery traceability
+- Full-text URL (if resolved): from `openAccessPdf.url`
 
 Watch for:
 
@@ -122,6 +139,7 @@ Record:
 - PMCID when available
 - DOI when available
 - Article type
+- Full-text URL (if resolved): PMC HTML or XML when PMCID is available
 
 Watch for:
 
@@ -140,6 +158,7 @@ Record:
 - SSRN abstract ID
 - SSRN URL
 - Publication status if later journal publication is found
+- Full-text URL (if resolved): from abstract page download links (best-effort)
 
 Watch for:
 
