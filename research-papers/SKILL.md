@@ -18,7 +18,9 @@ model: opus
 
 Use this skill to turn broad paper-search requests into a defensible literature search and synthesis. Start broad, narrow with explicit criteria, prefer stable landing pages and full text when available, and separate discovery metadata from evidence claims.
 
-**Full-text reading is the default, not the exception.** For every shortlisted paper, you MUST attempt to fetch and read the entire paper content — not just the abstract. Download PDFs when HTML full text is unavailable. Only fall back to abstract-based analysis when all full-text access methods have been exhausted and failed.
+**Full-text reading is the default, not the exception.** For every shortlisted paper, you MUST attempt to fetch and read the *entire* paper content — every page from title to references — not just the abstract or introduction. Download PDFs when HTML full text is unavailable. Only fall back to abstract-based analysis when all full-text access methods have been exhausted and failed.
+
+The script that does the fetch (`scripts/fetch_and_parse`) gives you two mechanical aids so the agent cannot skip content by accident: a chunked `read_plan` listing every Read call needed to cover the file, and an `END-OF-PAPER:<sha>` sentinel at the very end of the parsed file. You **must execute every entry in `read_plan`** and you **must quote back the matching sentinel** before producing any synthesis. Skipping either is a protocol violation.
 
 Common requests this skill should handle:
 
@@ -144,9 +146,9 @@ Separate these categories explicitly:
 
 Never imply that arXiv or SSRN papers are peer reviewed unless publication status is verified.
 
-### 6. Read and extract evidence (CRITICAL — read the full paper)
+### 6. Read and extract evidence (CRITICAL — read the entire paper)
 
-**This is the most important step.** For each shortlisted paper, fetch and read the complete paper content via the `scripts/fetch_and_parse` helper. Do not hand-roll PDF downloads, do not pass raw PDFs to the Read tool, and do not settle for abstracts when full text is accessible.
+**This is the most important step.** For each shortlisted paper, fetch and read every page of the paper via the `scripts/fetch_and_parse` helper. Do not hand-roll PDF downloads, do not pass raw PDFs to the Read tool, and do not settle for abstracts when full text is accessible.
 
 #### Canonical command
 
@@ -160,9 +162,37 @@ SKILL_DIR="$HOME/.claude/skills/research-papers"
 1. Resolves the identifier into canonical IDs.
 2. Runs the OA cascade: arXiv (HTML→PDF) → PMC (XML→HTML) → Unpaywall → OpenAlex `best_oa_location` → Semantic Scholar `openAccessPdf` → Crossref TDM links → DOI landing.
 3. Caches the raw file and a layout-aware Markdown parse to `~/.cache/research-papers/<canonical_id>/`.
-4. Prints a JSON record with `status` (`ok`, `abstract_only`, `failed`), `parsed_path`, `source`, and a `tried` log of what each step returned.
+4. Appends a unique `<!-- END-OF-PAPER:<sha> -->` sentinel to the parsed file.
+5. For PDF parses, extracts embedded figures to `<cache>/images/`, drops images that repeat on ≥25% of pages (journal logos, page headers, watermarks), and emits inline `![](path)` references in the parsed Markdown for the rest.
+6. Prints a JSON record with `status` (`ok`, `abstract_only`, `failed`), `parsed_path`, `parsed_lines`, `parsed_chars`, `sentinel`, `read_plan` (a chunked list of `{path, offset, limit}` Read calls covering the whole file), `figures` (a list of surviving image entries), `source`, and a `tried` log.
 
-When `status` is `ok`, read the file at `parsed_path` with the harness Read tool. The parsed Markdown preserves section headings, abstract, body, and figure captions. **Read the entire file** — for very long papers (>50KB parsed), read in segments: title + abstract + introduction first, then methods + results, then discussion + limitations.
+#### Mandatory reading protocol (when `status` is `ok`)
+
+You **MUST**:
+
+1. **Execute every entry in `read_plan` in order.** Each entry maps directly to a Read tool call: `Read(path, offset=offset, limit=limit)`. The plan is sized so each chunk fits the harness's 2000-line page; for short papers it has one entry, for long papers it has several. Reading only the first chunk of a multi-chunk paper is the same as not reading the paper.
+2. **Confirm the sentinel.** The final chunk's last lines contain `<!-- END-OF-PAPER:<sha> -->`. Compare the `<sha>` you see with the `sentinel` field from the script's JSON. If they match, you have read to the end. If you cannot quote the matching sentinel, you have not finished reading — go back and read the remaining chunks before writing any synthesis.
+3. **Do not skim.** The parsed Markdown contains the abstract, body, figure captions, tables, and references. Methods often hide caveats that contradict the abstract; limitations sections are where authors disclose where their results don't generalize; tables in appendices often hold the headline number behind a claim. Skipping any of these produces a synthesis the user cannot trust.
+
+If `parsed_lines` is missing from the JSON (older cached parses created before this protocol existed), re-run with `--force` to regenerate it; do not proceed without a `read_plan`.
+
+#### Reading figures
+
+The `figures` array is your menu of available images. Each entry has:
+
+- `path` — absolute path to a PNG you can pass to the Read tool. The Read tool is multimodal: `Read(path)` on a PNG renders the image inline.
+- `size_kb` — file size hint.
+- `instances` — copies in the source PDF; `>1` is unusual for content figures and may signal repeated decoration that slipped past the filter.
+- `caption_nearby` — `true` when the parsed Markdown has a "Figure N" / "Table N" / "Scheme N" / etc. caption within ~500 chars of the image reference. **Advisory only** — many real figures (chemical structures, schematic insets, equation renders) lack such captions, so do not use this as a hard filter.
+
+**Use judgment, not a rule.** Read figures whose content matters to the synthesis question:
+
+- Always read figures cited by name in a passage you are about to summarize ("as shown in Figure 3, …").
+- Read figures whose captions describe quantitative results, benchmarks, ablations, or schematics central to the method.
+- Skip figures whose captions describe peripheral material if your synthesis won't reference them.
+- When `caption_nearby` is `false` and `size_kb` is small (under ~5KB), it is often an inline equation render or sub-component — read it only if the surrounding text indicates it carries meaning.
+
+Repeating page decoration (logos, journal banners, watermarks) is filtered before this list reaches you. If you spot something that looks like decoration anyway, ignore it; do not waste a Read call.
 
 **Always set `OPENALEX_EMAIL` (and ideally `UNPAYWALL_EMAIL`)** in the environment before invoking the script. Without it Unpaywall is skipped and OpenAlex falls into the slower common pool; with it, full-text recovery rates roughly double for paywalled DOIs. Other useful env vars: `SEMANTIC_SCHOLAR_API_KEY`, `NCBI_API_KEY`, `NCBI_EMAIL`.
 
@@ -187,7 +217,7 @@ From the parsed Markdown, extract:
 - **Limitations**: Stated limitations and caveats
 - **Key figures/tables**: Summarize main quantitative results from tables and figure descriptions
 
-**Read thoroughly.** Do not skim. The user is asking you to research papers because they want deep understanding, not surface-level summaries.
+**Read thoroughly.** Do not skim. The user is asking you to research papers because they want deep understanding, not surface-level summaries. The `read_plan` + sentinel protocol above is non-negotiable; treat any synthesis written without quoting the matching sentinel as incomplete and rewrite it after finishing the read.
 
 #### When full text is truly unavailable
 

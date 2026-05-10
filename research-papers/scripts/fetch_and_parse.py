@@ -231,8 +231,18 @@ def cache_path(pid: PaperID, name: str) -> Path:
 # Parsers
 
 
-def parse_pdf_to_markdown(pdf_path: Path, out_path: Path) -> tuple[bool, str]:
-    """Best-effort parse to Markdown; returns (ok, parser_used)."""
+def parse_pdf_to_markdown(
+    pdf_path: Path, out_path: Path
+) -> tuple[bool, str, list[Path]]:
+    """Best-effort parse to Markdown.
+
+    Returns (ok, parser_used, image_paths). image_paths lists the absolute
+    paths of figures pymupdf4llm extracted alongside the Markdown; empty for
+    fallback parsers that do not extract images.
+    """
+    images_dir = out_path.parent / "images"
+    image_paths: list[Path] = []
+
     try:
         import pymupdf4llm  # type: ignore
 
@@ -241,18 +251,41 @@ def parse_pdf_to_markdown(pdf_path: Path, out_path: Path) -> tuple[bool, str]:
         sys.stdout.flush()
         saved_stdout_fd = os.dup(1)
         os.dup2(2, 1)
+        images_dir.mkdir(parents=True, exist_ok=True)
         try:
-            try:
-                md = pymupdf4llm.to_markdown(str(pdf_path), show_progress=False)
-            except TypeError:
-                md = pymupdf4llm.to_markdown(str(pdf_path))
+            # image_size_limit=0.05 drops images smaller than 5% of page area
+            # (typical icons / decorative rules). DPI capped to keep disk and
+            # vision-token usage reasonable.
+            kwargs = dict(
+                write_images=True,
+                image_path=str(images_dir),
+                image_size_limit=0.05,
+                dpi=150,
+                show_progress=False,
+            )
+            md = None
+            for drop in ((), ("show_progress",), ("show_progress", "dpi"),
+                         ("show_progress", "dpi", "image_size_limit"),
+                         ("show_progress", "dpi", "image_size_limit",
+                          "write_images", "image_path")):
+                attempt = {k: v for k, v in kwargs.items() if k not in drop}
+                try:
+                    md = pymupdf4llm.to_markdown(str(pdf_path), **attempt)
+                    break
+                except TypeError:
+                    continue
         finally:
             sys.stdout.flush()
             os.dup2(saved_stdout_fd, 1)
             os.close(saved_stdout_fd)
         if md and md.strip():
             out_path.write_text(md, encoding="utf-8")
-            return True, "pymupdf4llm"
+            if images_dir.exists():
+                image_paths = sorted(
+                    p for p in images_dir.iterdir()
+                    if p.suffix.lower() in {".png", ".jpg", ".jpeg"}
+                )
+            return True, "pymupdf4llm", image_paths
     except ImportError:
         pass
     except Exception as e:
@@ -269,7 +302,7 @@ def parse_pdf_to_markdown(pdf_path: Path, out_path: Path) -> tuple[bool, str]:
         text = "\n\n".join(chunks)
         if text.strip():
             out_path.write_text(text, encoding="utf-8")
-            return True, "pymupdf"
+            return True, "pymupdf", []
     except ImportError:
         pass
     except Exception as e:
@@ -283,11 +316,193 @@ def parse_pdf_to_markdown(pdf_path: Path, out_path: Path) -> tuple[bool, str]:
                 timeout=120,
             )
             if out_path.exists() and out_path.stat().st_size > 0:
-                return True, "pdftotext"
+                return True, "pdftotext", []
         except (subprocess.SubprocessError, OSError) as e:
             sys.stderr.write(f"pdftotext failed: {e}\n")
 
-    return False, "none"
+    return False, "none", []
+
+
+CAPTION_RE = re.compile(
+    r"\b(?:Figure|Fig\.|Table|Scheme|Diagram|Plate|Chart)\s*[\dIVXLCM]+",
+    re.IGNORECASE,
+)
+
+
+def _has_caption_nearby(md_text: str, image_name: str) -> bool:
+    pattern = rf"!\[[^\]]*\]\([^)]*{re.escape(image_name)}\)"
+    for m in re.finditer(pattern, md_text):
+        start = max(0, m.start() - 500)
+        end = min(len(md_text), m.end() + 500)
+        if CAPTION_RE.search(md_text[start:end]):
+            return True
+    return False
+
+
+def _dhash(path: Path) -> Optional[int]:
+    """Compute a 64-bit difference hash. Returns None if Pillow is missing
+    or the file is not a readable image."""
+    try:
+        from PIL import Image  # type: ignore
+    except ImportError:
+        return None
+    try:
+        with Image.open(path) as img:
+            small = img.convert("L").resize((9, 8), Image.LANCZOS)
+            pixels = list(small.getdata())
+    except Exception:
+        return None
+    h = 0
+    for row in range(8):
+        base = row * 9
+        for col in range(8):
+            h = (h << 1) | (1 if pixels[base + col] > pixels[base + col + 1] else 0)
+    return h
+
+
+def _hamming(a: int, b: int) -> int:
+    return (a ^ b).bit_count()
+
+
+def _group_near_duplicates(
+    image_paths: list[Path], threshold: int = 5
+) -> list[list[Path]]:
+    """Group images that are visually near-duplicates.
+
+    Uses dHash + Hamming distance when Pillow is available so that the same
+    logo rasterized slightly differently per page (different DPI / cropping
+    / anti-aliasing) still groups together. Falls back to exact-byte SHA-1
+    grouping when Pillow is unavailable.
+    """
+    sigs: list[tuple[Path, int, str]] = []
+    for f in image_paths:
+        dh = _dhash(f)
+        try:
+            sha = hashlib.sha1(f.read_bytes()).hexdigest()
+        except OSError:
+            continue
+        sigs.append((f, dh if dh is not None else -1, sha))
+
+    has_dhash = any(dh != -1 for _, dh, _ in sigs)
+    if not has_dhash:
+        # Pillow unavailable — fall back to exact-byte grouping
+        sha_to_files: dict[str, list[Path]] = {}
+        for f, _, sha in sigs:
+            sha_to_files.setdefault(sha, []).append(f)
+        return list(sha_to_files.values())
+
+    # Union-find by Hamming distance on dHashes
+    n = len(sigs)
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(n):
+        if sigs[i][1] == -1:
+            continue
+        for j in range(i + 1, n):
+            if sigs[j][1] == -1:
+                # dHash failed for this image — match by exact bytes only
+                if sigs[i][2] == sigs[j][2]:
+                    union(i, j)
+                continue
+            if _hamming(sigs[i][1], sigs[j][1]) <= threshold:
+                union(i, j)
+
+    groups: dict[int, list[Path]] = {}
+    for i, (f, _, _) in enumerate(sigs):
+        groups.setdefault(find(i), []).append(f)
+    return list(groups.values())
+
+
+def _collect_pdf_figures(
+    pdf_path: Path,
+    parsed_md_path: Path,
+    image_paths: list[Path],
+) -> list[dict]:
+    """Drop repeating page decorations; return metadata for content figures.
+
+    Strategy: group images by perceptual hash (dHash + Hamming distance, with
+    SHA-1 fallback). If a group covers >=25% of pages or >=3 instances
+    (whichever is greater) the group is treated as page decoration
+    (header/footer/watermark/journal logo) and deleted along with its
+    Markdown references. Surviving groups collapse to a single canonical
+    file. Each survivor is surfaced with a `caption_nearby` advisory boolean
+    — true when "Figure N" / "Table N" / "Scheme N" / etc. appears within
+    ~500 chars of the reference. The boolean is *not* used to drop images,
+    since real figures often lack such captions.
+    """
+    if not image_paths:
+        return []
+
+    n_pages = len(image_paths)  # safe lower bound
+    try:
+        import pymupdf  # type: ignore
+        doc = pymupdf.open(str(pdf_path))
+        n_pages = max(n_pages, len(doc))
+        doc.close()
+    except Exception:
+        pass
+
+    repeat_threshold = max(3, int(n_pages * 0.25))
+
+    md_text = (
+        parsed_md_path.read_text(encoding="utf-8")
+        if parsed_md_path.exists()
+        else ""
+    )
+    md_changed = False
+    figures: list[dict] = []
+
+    for group in _group_near_duplicates(image_paths):
+        if len(group) >= repeat_threshold:
+            for f in group:
+                replaced = re.sub(
+                    rf"\n?!\[[^\]]*\]\([^)]*{re.escape(f.name)}\)\n?",
+                    "\n",
+                    md_text,
+                )
+                if replaced != md_text:
+                    md_changed = True
+                    md_text = replaced
+                f.unlink(missing_ok=True)
+            continue
+
+        canonical = group[0]
+        for dup in group[1:]:
+            replaced = re.sub(
+                rf"!\[([^\]]*)\]\([^)]*{re.escape(dup.name)}\)",
+                rf"![\1]({canonical.name})",
+                md_text,
+            )
+            if replaced != md_text:
+                md_changed = True
+                md_text = replaced
+            dup.unlink(missing_ok=True)
+
+        figures.append(
+            {
+                "path": str(canonical.resolve()),
+                "size_kb": round(canonical.stat().st_size / 1024, 1),
+                "instances": len(group),
+                "caption_nearby": _has_caption_nearby(md_text, canonical.name),
+            }
+        )
+
+    if md_changed and parsed_md_path.exists():
+        parsed_md_path.write_text(md_text, encoding="utf-8")
+
+    figures.sort(key=lambda d: d["path"])
+    return figures
 
 
 def parse_html_to_text(html: bytes, out_path: Path) -> bool:
@@ -400,6 +615,11 @@ class FetchResult:
     abstract: Optional[str] = None
     tried: list[dict] = field(default_factory=list)
     note: Optional[str] = None
+    parsed_lines: Optional[int] = None
+    parsed_chars: Optional[int] = None
+    sentinel: Optional[str] = None
+    read_plan: list[dict] = field(default_factory=list)
+    figures: list[dict] = field(default_factory=list)
 
 
 def _record(result: FetchResult, step: str, outcome: str) -> None:
@@ -410,7 +630,7 @@ def _save_pdf(body: bytes, pid: PaperID, source: str, result: FetchResult) -> bo
     raw = cache_path(pid, "raw.pdf")
     raw.write_bytes(body)
     parsed = cache_path(pid, "parsed.md")
-    ok, parser = parse_pdf_to_markdown(raw, parsed)
+    ok, parser, image_paths = parse_pdf_to_markdown(raw, parsed)
     if not ok:
         return False
     result.source = source
@@ -419,6 +639,8 @@ def _save_pdf(body: bytes, pid: PaperID, source: str, result: FetchResult) -> bo
     result.parsed_path = str(parsed)
     result.parser = parser
     result.status = "ok"
+    if image_paths:
+        result.figures = _collect_pdf_figures(raw, parsed, image_paths)
     return True
 
 
@@ -480,6 +702,59 @@ def _fetch_url_save(
             return True
     _record(result, source, f"unsupported content-type {ctype}")
     return False
+
+
+# ---------------------------------------------------------------------------
+# Finalization: end-of-paper sentinel + read plan
+
+
+SENTINEL_RE = re.compile(r"\n+<!--\s*END-OF-PAPER:[a-f0-9]+\s*-->\s*$")
+READ_CHUNK = 2000
+
+
+def _finalize_result(pid: PaperID, result: FetchResult) -> None:
+    """Append END-OF-PAPER sentinel and build a read plan. Idempotent.
+
+    The sentinel lets the agent prove it scrolled to the end. The read plan
+    is the chunked list of Read calls the agent must execute to cover the
+    whole file at the harness's 2000-line page size.
+    """
+    if not result.parsed_path:
+        return
+    p = Path(result.parsed_path)
+    if not p.exists():
+        return
+
+    original = p.read_text(encoding="utf-8")
+    body = SENTINEL_RE.sub("", original).rstrip()
+    sentinel_hash = hashlib.sha1(
+        (pid.canonical + "\n" + body).encode("utf-8")
+    ).hexdigest()[:12]
+    final = f"{body}\n\n<!-- END-OF-PAPER:{sentinel_hash} -->\n"
+    if final != original:
+        p.write_text(final, encoding="utf-8")
+
+    lines = final.count("\n")
+    chars = len(final)
+
+    plan: list[dict] = []
+    offset = 0
+    while offset < lines:
+        plan.append(
+            {
+                "path": str(p),
+                "offset": offset,
+                "limit": min(READ_CHUNK, lines - offset),
+            }
+        )
+        offset += READ_CHUNK
+    if not plan:
+        plan = [{"path": str(p), "offset": 0, "limit": max(1, lines)}]
+
+    result.parsed_lines = lines
+    result.parsed_chars = chars
+    result.sentinel = sentinel_hash
+    result.read_plan = plan
 
 
 # ---------------------------------------------------------------------------
@@ -855,6 +1130,10 @@ def fetch_and_parse(identifier: str, force: bool = False) -> FetchResult:
         cached = cached_result(pid)
         if cached and cached.status in ("ok", "abstract_only"):
             cached.tried.append({"step": "cache", "outcome": "hit"})
+            # Idempotent — upgrades older cached parses that lack a sentinel
+            # or read_plan to the current schema.
+            _finalize_result(pid, cached)
+            save_meta(pid, cached)
             return cached
 
     for step in CASCADE:
@@ -862,6 +1141,7 @@ def fetch_and_parse(identifier: str, force: bool = False) -> FetchResult:
             if step(pid, result):
                 # keep IDs in sync if the step resolved a PMCID etc.
                 result.pmcid = result.pmcid or pid.pmcid
+                _finalize_result(pid, result)
                 save_meta(pid, result)
                 return result
         except Exception as e:
@@ -886,6 +1166,7 @@ def fetch_and_parse(identifier: str, force: bool = False) -> FetchResult:
         if not result.note:
             result.note = "All sources failed and no abstract was retrievable"
 
+    _finalize_result(pid, result)
     save_meta(pid, result)
     return result
 

@@ -2,3 +2,8 @@
 # fetch_and_parse.py falls back to pymupdf alone, then to the `pdftotext` binary,
 # but quality is best with pymupdf4llm.
 pymupdf4llm>=0.0.17
+# Used for perceptual-hash grouping of extracted figures so that repeating
+# page decoration (logos, banners) is dropped even when each instance is
+# rasterized slightly differently per page. Falls back to exact SHA-1
+# grouping if Pillow is unavailable.
+Pillow>=10.0.0
