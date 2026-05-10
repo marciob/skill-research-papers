@@ -231,53 +231,75 @@ def cache_path(pid: PaperID, name: str) -> Path:
 # Parsers
 
 
+_OCR_MARKERS = (b"OCR on page", b"Using Tesseract", b"Tesseract for OCR")
+
+
 def parse_pdf_to_markdown(
     pdf_path: Path, out_path: Path
-) -> tuple[bool, str, list[Path]]:
+) -> tuple[bool, str, list[Path], bool]:
     """Best-effort parse to Markdown.
 
-    Returns (ok, parser_used, image_paths). image_paths lists the absolute
-    paths of figures pymupdf4llm extracted alongside the Markdown; empty for
-    fallback parsers that do not extract images.
+    Returns (ok, parser_used, image_paths, used_ocr). image_paths lists
+    the absolute paths of figures pymupdf4llm extracted alongside the
+    Markdown; empty for fallback parsers that do not extract images.
+    used_ocr is True when MuPDF fell through to Tesseract for any page,
+    None-equivalent (False) for the text-only fallbacks.
     """
+    import tempfile
+
     images_dir = out_path.parent / "images"
     image_paths: list[Path] = []
+    used_ocr = False
 
     try:
         import pymupdf4llm  # type: ignore
 
-        # MuPDF writes OCR progress directly to fd 1; redirect fd 1 -> fd 2
-        # for the duration of the call so JSON on stdout stays clean.
+        # MuPDF writes OCR progress directly to fd 1. Capture it to a
+        # tempfile so the JSON on real stdout stays clean *and* we can
+        # scan for "OCR on page" / "Using Tesseract" markers afterward.
         sys.stdout.flush()
         saved_stdout_fd = os.dup(1)
-        os.dup2(2, 1)
-        images_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            # image_size_limit=0.05 drops images smaller than 5% of page area
-            # (typical icons / decorative rules). DPI capped to keep disk and
-            # vision-token usage reasonable.
-            kwargs = dict(
-                write_images=True,
-                image_path=str(images_dir),
-                image_size_limit=0.05,
-                dpi=150,
-                show_progress=False,
-            )
+        captured = b""
+        with tempfile.TemporaryFile(mode="w+b") as tmpf:
+            os.dup2(tmpf.fileno(), 1)
+            images_dir.mkdir(parents=True, exist_ok=True)
             md = None
-            for drop in ((), ("show_progress",), ("show_progress", "dpi"),
-                         ("show_progress", "dpi", "image_size_limit"),
-                         ("show_progress", "dpi", "image_size_limit",
-                          "write_images", "image_path")):
-                attempt = {k: v for k, v in kwargs.items() if k not in drop}
-                try:
-                    md = pymupdf4llm.to_markdown(str(pdf_path), **attempt)
-                    break
-                except TypeError:
-                    continue
-        finally:
-            sys.stdout.flush()
-            os.dup2(saved_stdout_fd, 1)
-            os.close(saved_stdout_fd)
+            try:
+                # image_size_limit=0.05 drops images smaller than 5% of
+                # page area (typical icons / decorative rules). DPI capped
+                # to keep disk and vision-token usage reasonable.
+                kwargs = dict(
+                    write_images=True,
+                    image_path=str(images_dir),
+                    image_size_limit=0.05,
+                    dpi=150,
+                    show_progress=False,
+                )
+                for drop in ((), ("show_progress",), ("show_progress", "dpi"),
+                             ("show_progress", "dpi", "image_size_limit"),
+                             ("show_progress", "dpi", "image_size_limit",
+                              "write_images", "image_path")):
+                    attempt = {k: v for k, v in kwargs.items() if k not in drop}
+                    try:
+                        md = pymupdf4llm.to_markdown(str(pdf_path), **attempt)
+                        break
+                    except TypeError:
+                        continue
+            finally:
+                sys.stdout.flush()
+                os.dup2(saved_stdout_fd, 1)
+                os.close(saved_stdout_fd)
+                tmpf.seek(0)
+                captured = tmpf.read()
+        # Echo MuPDF's progress output to the real stderr so the user can
+        # still see what happened; scan it for OCR signals separately.
+        if captured:
+            try:
+                sys.stderr.buffer.write(captured)
+                sys.stderr.buffer.flush()
+            except Exception:
+                pass
+        used_ocr = any(m in captured for m in _OCR_MARKERS)
         if md and md.strip():
             out_path.write_text(md, encoding="utf-8")
             if images_dir.exists():
@@ -285,7 +307,7 @@ def parse_pdf_to_markdown(
                     p for p in images_dir.iterdir()
                     if p.suffix.lower() in {".png", ".jpg", ".jpeg"}
                 )
-            return True, "pymupdf4llm", image_paths
+            return True, "pymupdf4llm", image_paths, used_ocr
     except ImportError:
         pass
     except Exception as e:
@@ -302,7 +324,7 @@ def parse_pdf_to_markdown(
         text = "\n\n".join(chunks)
         if text.strip():
             out_path.write_text(text, encoding="utf-8")
-            return True, "pymupdf", []
+            return True, "pymupdf", [], False
     except ImportError:
         pass
     except Exception as e:
@@ -316,11 +338,11 @@ def parse_pdf_to_markdown(
                 timeout=120,
             )
             if out_path.exists() and out_path.stat().st_size > 0:
-                return True, "pdftotext", []
+                return True, "pdftotext", [], False
         except (subprocess.SubprocessError, OSError) as e:
             sys.stderr.write(f"pdftotext failed: {e}\n")
 
-    return False, "none", []
+    return False, "none", [], False
 
 
 CAPTION_RE = re.compile(
@@ -422,6 +444,159 @@ def _group_near_duplicates(
     for i, (f, _, _) in enumerate(sigs):
         groups.setdefault(find(i), []).append(f)
     return list(groups.values())
+
+
+def _resolve_url(src: str, base: str) -> Optional[str]:
+    """Resolve a possibly-relative <img src> against the page URL.
+
+    Returns None for unfetchable schemes (data:, javascript:) or empty src.
+    """
+    src = (src or "").strip()
+    if not src or src.startswith(("data:", "javascript:", "mailto:", "tel:")):
+        return None
+    if src.startswith("//"):
+        scheme = base.split("://", 1)[0] if "://" in base else "https"
+        return f"{scheme}:{src}"
+    if src.startswith(("http://", "https://")):
+        return src
+    if not base:
+        return None
+    return urllib.parse.urljoin(base, src)
+
+
+def _collect_html_figures(
+    image_refs: list[tuple[str, str]],
+    base_url: str,
+    pid: PaperID,
+    parsed_md_path: Path,
+) -> list[dict]:
+    """Fetch <img> URLs surfaced by the HTML parser, dedupe, surface as figures.
+
+    Mirrors `_collect_pdf_figures`: groups fetched files by perceptual hash
+    (dHash + Hamming, with SHA-1 fallback), drops groups covering >=25% of
+    unique URLs (or >=3 instances) as page decoration, and rewrites
+    parsed.md so `![](src)` references point to the local cached file.
+    Survivors are surfaced with `{path, size_kb, instances, caption_nearby,
+    alt}`. Skips images smaller than 200 bytes (placeholder pixels).
+
+    The HTML parser emits raw `src` attributes (often relative). We track
+    the mapping from original src → resolved URL → local file so that the
+    Markdown rewrite can match the literal text the user wrote.
+    """
+    if not image_refs:
+        return []
+
+    images_dir = parsed_md_path.parent / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    src_to_resolved: dict[str, str] = {}
+    resolved_to_path: dict[str, Path] = {}
+    src_to_alt: dict[str, str] = {}
+    for src, alt in image_refs:
+        if alt and not src_to_alt.get(src):
+            src_to_alt[src] = alt
+        if src in src_to_resolved:
+            continue
+        resolved = _resolve_url(src, base_url)
+        if not resolved:
+            continue
+        src_to_resolved[src] = resolved
+        if resolved in resolved_to_path:
+            continue
+        path_part = resolved.split("?")[0].split("#")[0].lower()
+        ext = ".png"
+        for cand in (".jpg", ".jpeg", ".gif", ".webp", ".svg", ".png"):
+            if path_part.endswith(cand):
+                ext = cand
+                break
+        url_hash = hashlib.sha1(resolved.encode()).hexdigest()[:12]
+        local_path = images_dir / f"html-{url_hash}{ext}"
+        if not local_path.exists():
+            try:
+                status, body, _ = http_get(resolved, timeout=15)
+            except Exception:
+                continue
+            if status != 200 or not body or len(body) < 200:
+                continue
+            local_path.write_bytes(body)
+        resolved_to_path[resolved] = local_path
+
+    if not resolved_to_path:
+        return []
+
+    md_text = (
+        parsed_md_path.read_text(encoding="utf-8")
+        if parsed_md_path.exists()
+        else ""
+    )
+    md_changed = False
+
+    # Build the inverse: each fetched local file → list of original src
+    # strings that point to it (possibly through different resolved URLs
+    # that happened to dedupe at the local-cache layer).
+    path_to_srcs: dict[Path, list[str]] = {}
+    for src, resolved in src_to_resolved.items():
+        p = resolved_to_path.get(resolved)
+        if p is not None:
+            path_to_srcs.setdefault(p, []).append(src)
+
+    paths = list(dict.fromkeys(resolved_to_path.values()))
+    repeat_threshold = max(3, int(len(paths) * 0.25))
+
+    figures: list[dict] = []
+
+    for group in _group_near_duplicates(paths):
+        if len(group) >= repeat_threshold:
+            for f in group:
+                for src in path_to_srcs.get(f, []):
+                    replaced = re.sub(
+                        rf"\n?!\[[^\]]*\]\({re.escape(src)}\)\n?",
+                        "\n",
+                        md_text,
+                    )
+                    if replaced != md_text:
+                        md_changed = True
+                        md_text = replaced
+                f.unlink(missing_ok=True)
+            continue
+
+        canonical = group[0]
+        canonical_str = str(canonical.resolve())
+        for f in group:
+            for src in path_to_srcs.get(f, []):
+                replaced = re.sub(
+                    rf"!\[([^\]]*)\]\({re.escape(src)}\)",
+                    rf"![\1]({canonical_str})",
+                    md_text,
+                )
+                if replaced != md_text:
+                    md_changed = True
+                    md_text = replaced
+            if f != canonical:
+                f.unlink(missing_ok=True)
+
+        alts = [
+            src_to_alt.get(src, "")
+            for f in group
+            for src in path_to_srcs.get(f, [])
+        ]
+        alt = next((a for a in alts if a), "")
+
+        figures.append(
+            {
+                "path": canonical_str,
+                "size_kb": round(canonical.stat().st_size / 1024, 1),
+                "instances": len(group),
+                "caption_nearby": _has_caption_nearby(md_text, canonical.name),
+                "alt": alt,
+            }
+        )
+
+    if md_changed and parsed_md_path.exists():
+        parsed_md_path.write_text(md_text, encoding="utf-8")
+
+    figures.sort(key=lambda d: d["path"])
+    return figures
 
 
 def _collect_pdf_figures(
@@ -556,12 +731,17 @@ _HEADING_TAGS = {
 }
 
 
-def parse_html_to_markdown(html: bytes, out_path: Path) -> bool:
+def parse_html_to_markdown(
+    html: bytes, out_path: Path
+) -> tuple[bool, list[tuple[str, str]]]:
     """Parse HTML to a Markdown-flavoured plaintext rendering.
 
     Preserves heading hierarchy (h1-h6 → #-######), figure boundaries with
     captions in italics, list items, and inline emphasis. Skips chrome
-    (script/style/nav/header/footer/aside/noscript). The output is what gets
+    (script/style/nav/header/footer/aside/noscript/form/iframe). Returns
+    (ok, image_refs) where image_refs is a list of (src, alt) tuples
+    extracted from `<img>` tags inside the kept body — callers fetch and
+    filter these via _collect_html_figures. The output is what gets
     written to parsed.md, so downstream agents see real `## Methods` /
     `## Results` headings instead of flat text.
     """
@@ -668,17 +848,17 @@ def parse_html_to_markdown(html: bytes, out_path: Path) -> bool:
         rendered = re.sub(r"[ \t]+\n", "\n", rendered)
         rendered = re.sub(r"\n{3,}", "\n\n", rendered).strip()
         if not rendered:
-            return False
+            return False, []
         out_path.write_text(rendered, encoding="utf-8")
-        return True
+        return True, list(extractor.images)
     except Exception as e:
         sys.stderr.write(f"HTML parse failed: {e}\n")
-        return False
+        return False, []
 
 
 # Back-compat alias: callers used to import parse_html_to_text. The new
-# implementation produces Markdown-flavoured output but keeps the same
-# (bytes, Path) -> bool signature.
+# implementation produces Markdown-flavoured output and now also returns
+# the image refs it collected.
 parse_html_to_text = parse_html_to_markdown
 
 
@@ -751,6 +931,7 @@ class FetchResult:
     sentinel: Optional[str] = None
     read_plan: list[dict] = field(default_factory=list)
     figures: list[dict] = field(default_factory=list)
+    parser_used_ocr: Optional[bool] = None
 
 
 def _record(result: FetchResult, step: str, outcome: str) -> None:
@@ -761,7 +942,7 @@ def _save_pdf(body: bytes, pid: PaperID, source: str, result: FetchResult) -> bo
     raw = cache_path(pid, "raw.pdf")
     raw.write_bytes(body)
     parsed = cache_path(pid, "parsed.md")
-    ok, parser, image_paths = parse_pdf_to_markdown(raw, parsed)
+    ok, parser, image_paths, used_ocr = parse_pdf_to_markdown(raw, parsed)
     if not ok:
         return False
     result.source = source
@@ -769,19 +950,27 @@ def _save_pdf(body: bytes, pid: PaperID, source: str, result: FetchResult) -> bo
     result.raw_path = str(raw)
     result.parsed_path = str(parsed)
     result.parser = parser
+    result.parser_used_ocr = used_ocr
     result.status = "ok"
     if image_paths:
         result.figures = _collect_pdf_figures(raw, parsed, image_paths)
     return True
 
 
-def _save_html(body: bytes, pid: PaperID, source: str, result: FetchResult) -> bool:
+def _save_html(
+    body: bytes,
+    pid: PaperID,
+    source: str,
+    result: FetchResult,
+    source_url: str = "",
+) -> bool:
     if _detect_html_stub(body):
         return False
     raw = cache_path(pid, "raw.html")
     raw.write_bytes(body)
     parsed = cache_path(pid, "parsed.md")
-    if not parse_html_to_markdown(body, parsed):
+    ok, image_refs = parse_html_to_markdown(body, parsed)
+    if not ok:
         return False
     result.source = source
     result.format = "html"
@@ -789,6 +978,8 @@ def _save_html(body: bytes, pid: PaperID, source: str, result: FetchResult) -> b
     result.parsed_path = str(parsed)
     result.parser = "html"
     result.status = "ok"
+    if image_refs and source_url:
+        result.figures = _collect_html_figures(image_refs, source_url, pid, parsed)
     return True
 
 
@@ -834,7 +1025,7 @@ def _fetch_url_save(
         if stub_reason:
             _record(result, source, f"stub ({stub_reason})")
             return False
-        if _save_html(body, pid, source, result):
+        if _save_html(body, pid, source, result, source_url=url):
             _record(result, source, "ok html")
             return True
     _record(result, source, f"unsupported content-type {ctype}")
@@ -967,7 +1158,9 @@ def try_arxiv(pid: PaperID, result: FetchResult) -> bool:
                 stub_reason = _detect_html_stub(body)
                 if stub_reason:
                     _record(result, "arxiv_html", f"stub ({stub_reason})")
-                elif _save_html(body, pid, "arxiv_html", result):
+                elif _save_html(
+                    body, pid, "arxiv_html", result, source_url=html_url
+                ):
                     _record(result, "arxiv_html", "ok")
                     return True
         else:
@@ -1038,7 +1231,7 @@ def try_pmc(pid: PaperID, result: FetchResult) -> bool:
     html_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/"
     status, body, _ = http_get(html_url)
     if status == 200 and len(body) > 4000:
-        if _save_html(body, pid, "pmc_html", result):
+        if _save_html(body, pid, "pmc_html", result, source_url=html_url):
             _record(result, "pmc_html", "ok")
             return True
     _record(result, "pmc_html", f"http {status}")
@@ -1254,7 +1447,7 @@ def try_doi_landing(pid: PaperID, result: FetchResult) -> bool:
                 _record(result, "doi_landing", "ok pdf")
                 return True
         elif len(body) > 2000:
-            if _save_html(body, pid, "doi_landing_html", result):
+            if _save_html(body, pid, "doi_landing_html", result, source_url=url):
                 # DOI landing pages are usually paywall stubs, not full text
                 result.status = "abstract_only"
                 result.note = (
