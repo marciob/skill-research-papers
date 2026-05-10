@@ -505,50 +505,181 @@ def _collect_pdf_figures(
     return figures
 
 
-def parse_html_to_text(html: bytes, out_path: Path) -> bool:
+STUB_FINGERPRINTS = (
+    re.compile(r"Just a moment\.\.\.", re.IGNORECASE),
+    re.compile(r"Enable JavaScript and cookies to continue", re.IGNORECASE),
+    re.compile(r"Checking your browser before accessing", re.IGNORECASE),
+    re.compile(r"cf-(?:browser-verification|chl-bypass|spinner)", re.IGNORECASE),
+    re.compile(r"Please enable JS and disable any ad blocker", re.IGNORECASE),
+    re.compile(r"<title>\s*Access [Dd]enied", re.IGNORECASE),
+    re.compile(r"<title>\s*Page not found", re.IGNORECASE),
+    re.compile(
+        r"to (?:continue|keep) reading,?\s*(?:please\s+)?(?:sign in|log in|subscribe|register)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"this (?:content|article) is available to (?:subscribers|members) only",
+        re.IGNORECASE,
+    ),
+    re.compile(r"institutional access required", re.IGNORECASE),
+    re.compile(r"purchase (?:this )?(?:article|access)", re.IGNORECASE),
+)
+
+
+def _detect_html_stub(body: bytes) -> Optional[str]:
+    """Return a reason string if the HTML body is a paywall/challenge stub.
+
+    Catches Cloudflare challenges, "JS required" interstitials, "sign in to
+    continue" walls, and pages too short to plausibly contain a paper. Real
+    full-text HTML is generally >8 KB and lacks these fingerprints.
+    """
+    if not body:
+        return "empty body"
+    if len(body) < 3000:
+        return f"too short ({len(body)} bytes)"
+    sample = body[:16000].decode("utf-8", errors="replace")
+    for pat in STUB_FINGERPRINTS:
+        m = pat.search(sample)
+        if m:
+            snippet = m.group(0)[:60].strip()
+            return f"matched stub fingerprint: {snippet!r}"
+    return None
+
+
+_HEADING_TAGS = {
+    "h1": "#",
+    "h2": "##",
+    "h3": "###",
+    "h4": "####",
+    "h5": "#####",
+    "h6": "######",
+}
+
+
+def parse_html_to_markdown(html: bytes, out_path: Path) -> bool:
+    """Parse HTML to a Markdown-flavoured plaintext rendering.
+
+    Preserves heading hierarchy (h1-h6 → #-######), figure boundaries with
+    captions in italics, list items, and inline emphasis. Skips chrome
+    (script/style/nav/header/footer/aside/noscript). The output is what gets
+    written to parsed.md, so downstream agents see real `## Methods` /
+    `## Results` headings instead of flat text.
+    """
     from html.parser import HTMLParser
 
-    class TextExtractor(HTMLParser):
-        SKIP_TAGS = {"script", "style", "nav", "header", "footer", "noscript"}
-        BREAK_TAGS = {
-            "p", "div", "br", "h1", "h2", "h3", "h4", "h5", "h6",
-            "li", "tr", "section", "article",
+    class MarkdownExtractor(HTMLParser):
+        SKIP_TAGS = {
+            "script", "style", "nav", "header", "footer",
+            "noscript", "aside", "form", "iframe",
         }
+        BLOCK_TAGS = {
+            "p", "div", "section", "article", "blockquote", "pre",
+            "table", "tr",
+        }
+        EMPH_OPEN = {"strong": "**", "b": "**", "em": "*", "i": "*", "code": "`"}
 
         def __init__(self) -> None:
-            super().__init__()
+            super().__init__(convert_charrefs=True)
             self.parts: list[str] = []
             self.skip_depth = 0
+            self.heading_level: Optional[str] = None
+            self.heading_buf: list[str] = []
+            self.figcap_active = False
+            self.figcap_buf: list[str] = []
+            self.images: list[tuple[str, str]] = []  # (src, alt)
 
         def handle_starttag(self, tag: str, attrs) -> None:
+            tag = tag.lower()
             if tag in self.SKIP_TAGS:
                 self.skip_depth += 1
+                return
+            if self.skip_depth > 0:
+                return
+            if tag in _HEADING_TAGS:
+                self.heading_level = tag
+                self.heading_buf = []
+            elif tag == "br":
+                self.parts.append("\n")
+            elif tag in self.BLOCK_TAGS:
+                self.parts.append("\n\n")
+            elif tag == "li":
+                self.parts.append("\n- ")
+            elif tag == "figure":
+                self.parts.append("\n\n")
+            elif tag == "figcaption":
+                self.figcap_active = True
+                self.figcap_buf = []
+            elif tag == "img":
+                d = dict(attrs)
+                src = (d.get("src") or "").strip()
+                alt = (d.get("alt") or "").strip()
+                if src:
+                    self.images.append((src, alt))
+                    self.parts.append(f"![{alt}]({src})")
+            elif tag in self.EMPH_OPEN:
+                self.parts.append(self.EMPH_OPEN[tag])
 
         def handle_endtag(self, tag: str) -> None:
+            tag = tag.lower()
             if tag in self.SKIP_TAGS:
                 self.skip_depth = max(0, self.skip_depth - 1)
-            if tag in self.BREAK_TAGS:
+                return
+            if self.skip_depth > 0:
+                return
+            if tag in _HEADING_TAGS and self.heading_level == tag:
+                heading = " ".join("".join(self.heading_buf).split()).strip()
+                if heading:
+                    self.parts.append(
+                        f"\n\n{_HEADING_TAGS[tag]} {heading}\n\n"
+                    )
+                self.heading_level = None
+                self.heading_buf = []
+            elif tag == "figcaption":
+                self.figcap_active = False
+                cap = " ".join("".join(self.figcap_buf).split()).strip()
+                if cap:
+                    self.parts.append(f"\n\n*{cap}*\n")
+                self.figcap_buf = []
+            elif tag in self.BLOCK_TAGS:
                 self.parts.append("\n")
+            elif tag in self.EMPH_OPEN:
+                self.parts.append(self.EMPH_OPEN[tag])
 
         def handle_data(self, data: str) -> None:
-            if self.skip_depth == 0:
-                self.parts.append(data)
+            if self.skip_depth > 0:
+                return
+            if self.heading_level is not None:
+                self.heading_buf.append(data)
+                return
+            if self.figcap_active:
+                self.figcap_buf.append(data)
+                return
+            self.parts.append(data)
 
     try:
         try:
             text = html.decode("utf-8")
         except UnicodeDecodeError:
             text = html.decode("latin-1", errors="replace")
-        extractor = TextExtractor()
+        extractor = MarkdownExtractor()
         extractor.feed(text)
-        cleaned = re.sub(r"\n\s*\n+", "\n\n", "".join(extractor.parts)).strip()
-        if not cleaned:
+        rendered = "".join(extractor.parts)
+        # Collapse runs of blank lines and trim trailing whitespace per line
+        rendered = re.sub(r"[ \t]+\n", "\n", rendered)
+        rendered = re.sub(r"\n{3,}", "\n\n", rendered).strip()
+        if not rendered:
             return False
-        out_path.write_text(cleaned, encoding="utf-8")
+        out_path.write_text(rendered, encoding="utf-8")
         return True
     except Exception as e:
         sys.stderr.write(f"HTML parse failed: {e}\n")
         return False
+
+
+# Back-compat alias: callers used to import parse_html_to_text. The new
+# implementation produces Markdown-flavoured output but keeps the same
+# (bytes, Path) -> bool signature.
+parse_html_to_text = parse_html_to_markdown
 
 
 def parse_pmc_xml_to_markdown(xml: bytes, out_path: Path) -> bool:
@@ -645,10 +776,12 @@ def _save_pdf(body: bytes, pid: PaperID, source: str, result: FetchResult) -> bo
 
 
 def _save_html(body: bytes, pid: PaperID, source: str, result: FetchResult) -> bool:
+    if _detect_html_stub(body):
+        return False
     raw = cache_path(pid, "raw.html")
     raw.write_bytes(body)
     parsed = cache_path(pid, "parsed.md")
-    if not parse_html_to_text(body, parsed):
+    if not parse_html_to_markdown(body, parsed):
         return False
     result.source = source
     result.format = "html"
@@ -697,6 +830,10 @@ def _fetch_url_save(
             _record(result, source, "ok xml")
             return True
     if "html" in ctype or head.startswith(b"<html") or b"<!doctype" in head:
+        stub_reason = _detect_html_stub(body)
+        if stub_reason:
+            _record(result, source, f"stub ({stub_reason})")
+            return False
         if _save_html(body, pid, source, result):
             _record(result, source, "ok html")
             return True
@@ -761,22 +898,80 @@ def _finalize_result(pid: PaperID, result: FetchResult) -> None:
 # Cascade steps
 
 
+_ARXIV_ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
+
+
+def _fetch_arxiv_metadata(arxiv_id: str) -> dict:
+    """Pull title, year, and abstract from the arXiv Atom API.
+
+    arXiv's metadata API is free and unauthenticated. The id_list endpoint
+    accepts versioned and unversioned IDs identically. Returns an empty dict
+    on any error so callers can layer it conditionally.
+    """
+    base_id = arxiv_id.split("v")[0]
+    url = (
+        "https://export.arxiv.org/api/query?"
+        + urllib.parse.urlencode({"id_list": base_id})
+    )
+    status, body, _ = http_get(url)
+    if status != 200 or not body:
+        return {}
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return {}
+    entry = root.find("atom:entry", _ARXIV_ATOM_NS)
+    if entry is None:
+        return {}
+    out: dict = {}
+    title_el = entry.find("atom:title", _ARXIV_ATOM_NS)
+    if title_el is not None and title_el.text:
+        out["title"] = " ".join(title_el.text.split())
+    pub_el = entry.find("atom:published", _ARXIV_ATOM_NS)
+    if pub_el is not None and pub_el.text and len(pub_el.text) >= 4:
+        try:
+            out["year"] = int(pub_el.text[:4])
+        except ValueError:
+            pass
+    summary_el = entry.find("atom:summary", _ARXIV_ATOM_NS)
+    if summary_el is not None and summary_el.text:
+        out["abstract"] = " ".join(summary_el.text.split())
+    return out
+
+
 def try_arxiv(pid: PaperID, result: FetchResult) -> bool:
     if not pid.arxiv:
         return False
     arxiv_id = pid.arxiv
     is_old = "/" in arxiv_id
 
+    # Pull lightweight metadata first; even if full-text fetch fails the
+    # caller still has a title/year/abstract to work with.
+    meta = _fetch_arxiv_metadata(arxiv_id)
+    if meta:
+        if not result.title and meta.get("title"):
+            result.title = meta["title"]
+        if not result.year and meta.get("year"):
+            result.year = meta["year"]
+        if not result.abstract and meta.get("abstract"):
+            result.abstract = meta["abstract"]
+
     if not is_old:
         html_url = f"https://arxiv.org/html/{arxiv_id}"
         status, body, _ = http_get(html_url)
         if status == 200 and len(body) > 4000 and b"<html" in body[:1000].lower():
             # arxiv.org/html sometimes returns a thin "no HTML available" stub
-            if b"No HTML for" not in body[:4000]:
-                if _save_html(body, pid, "arxiv_html", result):
+            if b"No HTML for" in body[:4000]:
+                _record(result, "arxiv_html", "no html available")
+            else:
+                stub_reason = _detect_html_stub(body)
+                if stub_reason:
+                    _record(result, "arxiv_html", f"stub ({stub_reason})")
+                elif _save_html(body, pid, "arxiv_html", result):
                     _record(result, "arxiv_html", "ok")
                     return True
-        _record(result, "arxiv_html", f"http {status}")
+        else:
+            _record(result, "arxiv_html", f"http {status}")
 
     pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
     status, body, _ = http_get(pdf_url)
